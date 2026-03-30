@@ -31,6 +31,14 @@ def _get_or_compile(key, make_fn, *args, **kwargs):
     return _kernel_cache[key]
 
 
+def _strict_contiguous(tensor):
+    """Ensure tensor has standard contiguous strides (handles size-1 dims
+    where PyTorch considers any stride valid)."""
+    out = torch.empty(tensor.shape, device=tensor.device, dtype=tensor.dtype)
+    out.copy_(tensor)
+    return out
+
+
 # ============================================================
 # Conv2d with TileLang
 # ============================================================
@@ -46,9 +54,9 @@ class TileLangConv2dFunction(torch.autograd.Function):
         C_out, _, KH, KW = weight.shape
 
         # Convert to NHWC for TileLang (coalesced memory access)
-        input_nhwc = input.permute(0, 2, 3, 1).contiguous().half()
+        input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
         # Convert weight to HWCF: (KH, KW, C_in, C_out)
-        weight_hwcf = weight.permute(2, 3, 1, 0).contiguous().half()
+        weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
 
         OH = (H + 2 * padding - KH) // stride + 1
         OW = (W + 2 * padding - KW) // stride + 1
@@ -59,8 +67,7 @@ class TileLangConv2dFunction(torch.autograd.Function):
             key_fwd, make_conv2d_forward_kernel,
             N, C_in, H, W, C_out, KH, KW, stride=stride, padding=padding)
 
-        output_nhwc = torch.empty(N, OH, OW, C_out, device=input.device, dtype=torch.float16)
-        kernel_fwd(input_nhwc, weight_hwcf, output_nhwc)
+        output_nhwc = kernel_fwd(input_nhwc, weight_hwcf)
 
         # Convert output back to NCHW
         output = output_nhwc.permute(0, 3, 1, 2).float()
@@ -87,17 +94,16 @@ class TileLangConv2dFunction(torch.autograd.Function):
         grad_input = grad_weight = grad_bias = None
 
         # Convert to NHWC fp16
-        grad_out_nhwc = grad_output.permute(0, 2, 3, 1).contiguous().half()
-        input_nhwc = input.permute(0, 2, 3, 1).contiguous().half()
-        weight_hwcf = weight.permute(2, 3, 1, 0).contiguous().half()
+        grad_out_nhwc = _strict_contiguous(grad_output.permute(0, 2, 3, 1).half())
+        input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
+        weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
 
         if ctx.needs_input_grad[0]:
             key_bd = ('conv2d_bwd_data', N, C_in, H, W, C_out, KH, KW, stride, padding)
             kernel_bd = _get_or_compile(
                 key_bd, make_conv2d_backward_data_kernel,
                 N, C_in, H, W, C_out, KH, KW, stride=stride, padding=padding)
-            grad_input_nhwc = torch.empty(N, H, W, C_in, device=input.device, dtype=torch.float16)
-            kernel_bd(grad_out_nhwc, weight_hwcf, grad_input_nhwc)
+            grad_input_nhwc = kernel_bd(grad_out_nhwc, weight_hwcf)
             grad_input = grad_input_nhwc.permute(0, 3, 1, 2).float()
 
         if ctx.needs_input_grad[1]:
@@ -105,8 +111,7 @@ class TileLangConv2dFunction(torch.autograd.Function):
             kernel_bw = _get_or_compile(
                 key_bw, make_conv2d_backward_weight_kernel,
                 N, C_in, H, W, C_out, KH, KW, stride=stride, padding=padding)
-            grad_weight_hwcf = torch.empty(KH, KW, C_in, C_out, device=input.device, dtype=torch.float16)
-            kernel_bw(input_nhwc, grad_out_nhwc, grad_weight_hwcf)
+            grad_weight_hwcf = kernel_bw(input_nhwc, grad_out_nhwc)
             grad_weight = grad_weight_hwcf.permute(3, 2, 0, 1).float()
 
         if bias is not None and ctx.needs_input_grad[2]:
@@ -158,16 +163,14 @@ class TileLangLinearFunction(torch.autograd.Function):
         M, K = input_2d.shape
         N_out = weight.shape[0]
 
-        input_fp16 = input_2d.contiguous().half()
+        input_fp16 = _strict_contiguous(input_2d.half())
         # weight^T: (K, N_out)
-        weight_t = weight.t().contiguous().half()
+        weight_t = _strict_contiguous(weight.t().half())
 
         key = ('linear_fwd', M, N_out, K)
         kernel = _get_or_compile(key, make_gemm_kernel, M, N_out, K)
 
-        output = torch.empty(M, N_out, device=input.device, dtype=torch.float16)
-        kernel(input_fp16, weight_t, output)
-        output = output.float()
+        output = kernel(input_fp16, weight_t).float()
 
         if bias is not None:
             output = output + bias
@@ -189,23 +192,21 @@ class TileLangLinearFunction(torch.autograd.Function):
 
         if ctx.needs_input_grad[0]:
             # grad_input = grad_output @ weight
-            go_fp16 = grad_output_2d.contiguous().half()
-            w_fp16 = weight.contiguous().half()
+            go_fp16 = _strict_contiguous(grad_output_2d.half())
+            w_fp16 = _strict_contiguous(weight.half())
             key = ('linear_bwd_input', M, K, N_out)
             kernel = _get_or_compile(key, make_gemm_kernel, M, K, N_out)
-            gi = torch.empty(M, K, device=input.device, dtype=torch.float16)
             # grad_output (M, N_out) @ weight (N_out, K) -> (M, K)
-            kernel(go_fp16, w_fp16.t().contiguous(), gi)
+            gi = kernel(go_fp16, w_fp16)
             grad_input = gi.float().reshape(input.shape)
 
         if ctx.needs_input_grad[1]:
             # grad_weight = grad_output^T @ input -> (N_out, K)
-            go_fp16 = grad_output_2d.t().contiguous().half()
-            in_fp16 = input_2d.contiguous().half()
+            go_fp16 = _strict_contiguous(grad_output_2d.t().half())
+            in_fp16 = _strict_contiguous(input_2d.half())
             key = ('linear_bwd_weight', N_out, K, M)
             kernel = _get_or_compile(key, make_gemm_kernel, N_out, K, M)
-            gw = torch.empty(N_out, K, device=input.device, dtype=torch.float16)
-            kernel(go_fp16, in_fp16, gw)
+            gw = kernel(go_fp16, in_fp16)
             grad_weight = gw.float()
 
         if bias is not None and ctx.needs_input_grad[2]:

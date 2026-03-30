@@ -26,7 +26,7 @@ def load_data(data_dir, img_size=28):
         if not os.path.isdir(class_dir):
             print(f"Warning: {class_dir} not found, skipping.")
             continue
-        for fname in os.listdir(class_dir):
+        for fname in sorted(os.listdir(class_dir)):
             if not fname.lower().endswith('.bmp'):
                 continue
             fpath = os.path.join(class_dir, fname)
@@ -112,7 +112,8 @@ def evaluate(net, X, y_onehot):
 
 
 def main():
-    np.random.seed(42)
+    SEED = 42
+    np.random.seed(SEED)
 
     # Paths
     script_dir = os.path.dirname(os.path.abspath(__file__))

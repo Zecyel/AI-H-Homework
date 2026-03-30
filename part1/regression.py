@@ -21,7 +21,8 @@ def generate_data(n_train=1000, n_test=500):
 
 
 def main():
-    np.random.seed(42)
+    SEED = 42
+    np.random.seed(SEED)
 
     X_train, y_train, X_test, y_test = generate_data(n_train=2000, n_test=500)
 

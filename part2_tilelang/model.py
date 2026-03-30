@@ -1,14 +1,16 @@
 """
 PyTorch autograd wrappers for TileLang kernels.
-Provides nn.Module-compatible layers that use TileLang for forward/backward.
+Loads optimal tile configurations from autotune cache.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tilelang
-import numpy as np
-from functools import lru_cache
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
 
 from kernels import (
     make_gemm_kernel,
@@ -16,24 +18,54 @@ from kernels import (
     make_conv2d_backward_data_kernel,
     make_conv2d_backward_weight_kernel,
 )
+from autotune import lookup_or_default, get_cache_key, load_cache
 
 # ============================================================
-# Kernel cache — compile once per shape
+# Kernel cache — compile once per (shape, config)
 # ============================================================
 
 _kernel_cache = {}
+_autotune_cache = None
 
 
-def _get_or_compile(key, make_fn, *args, **kwargs):
+def _load_autotune():
+    global _autotune_cache
+    if _autotune_cache is None:
+        _autotune_cache = load_cache()
+        if _autotune_cache:
+            print(f"[TileLang] Loaded {len(_autotune_cache)} autotuned kernel configs")
+        else:
+            print("[TileLang] WARNING: No autotune cache found. Run `python autotune.py` first.")
+            print("[TileLang] Using conservative default configs (will be slower).")
+    return _autotune_cache
+
+
+def _get_config(name, shape_args):
+    """Get the best config for a kernel from autotune cache."""
+    cache = _load_autotune()
+    key = get_cache_key(name, shape_args)
+    if key in cache:
+        return cache[key]["config"]
+    return {
+        "block_M": 32, "block_N": 32, "block_K": 16,
+        "num_stages": 2, "threads": 128,
+    }
+
+
+def _compile_kernel(key, make_fn, shape_args, config):
+    """Compile kernel with specific config, caching the result."""
     if key not in _kernel_cache:
-        prim_func = make_fn(*args, **kwargs)
+        full_args = list(shape_args) + [
+            config["block_M"], config["block_N"], config["block_K"],
+            config["num_stages"], config["threads"],
+        ]
+        prim_func = make_fn(*full_args)
         _kernel_cache[key] = tilelang.compile(prim_func, out_idx=[2], target="auto")
     return _kernel_cache[key]
 
 
 def _strict_contiguous(tensor):
-    """Ensure tensor has standard contiguous strides (handles size-1 dims
-    where PyTorch considers any stride valid)."""
+    """Ensure tensor has standard contiguous strides (handles size-1 dims)."""
     out = torch.empty(tensor.shape, device=tensor.device, dtype=tensor.dtype)
     out.copy_(tensor)
     return out
@@ -46,30 +78,18 @@ def _strict_contiguous(tensor):
 class TileLangConv2dFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, stride, padding):
-        """
-        input: (N, C_in, H, W) — PyTorch NCHW
-        weight: (C_out, C_in, KH, KW) — PyTorch standard
-        """
         N, C_in, H, W = input.shape
         C_out, _, KH, KW = weight.shape
 
-        # Convert to NHWC for TileLang (coalesced memory access)
         input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
-        # Convert weight to HWCF: (KH, KW, C_in, C_out)
         weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
 
-        OH = (H + 2 * padding - KH) // stride + 1
-        OW = (W + 2 * padding - KW) // stride + 1
+        shape_args = (N, C_in, H, W, C_out, KH, KW, stride, padding)
+        config = _get_config("conv2d_fwd", shape_args)
+        key = ('conv2d_fwd', *shape_args, tuple(sorted(config.items())))
+        kernel = _compile_kernel(key, make_conv2d_forward_kernel, shape_args, config)
 
-        # Pad dimensions to be multiples of block sizes for GEMM efficiency
-        key_fwd = ('conv2d_fwd', N, C_in, H, W, C_out, KH, KW, stride, padding)
-        kernel_fwd = _get_or_compile(
-            key_fwd, make_conv2d_forward_kernel,
-            N, C_in, H, W, C_out, KH, KW, stride=stride, padding=padding)
-
-        output_nhwc = kernel_fwd(input_nhwc, weight_hwcf)
-
-        # Convert output back to NCHW
+        output_nhwc = kernel(input_nhwc, weight_hwcf)
         output = output_nhwc.permute(0, 3, 1, 2).float()
 
         if bias is not None:
@@ -88,30 +108,27 @@ class TileLangConv2dFunction(torch.autograd.Function):
 
         N, C_in, H, W = input.shape
         C_out, _, KH, KW = weight.shape
-        OH = (H + 2 * padding - KH) // stride + 1
-        OW = (W + 2 * padding - KW) // stride + 1
 
         grad_input = grad_weight = grad_bias = None
 
-        # Convert to NHWC fp16
         grad_out_nhwc = _strict_contiguous(grad_output.permute(0, 2, 3, 1).half())
         input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
         weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
 
+        conv_shape = (N, C_in, H, W, C_out, KH, KW, stride, padding)
+
         if ctx.needs_input_grad[0]:
-            key_bd = ('conv2d_bwd_data', N, C_in, H, W, C_out, KH, KW, stride, padding)
-            kernel_bd = _get_or_compile(
-                key_bd, make_conv2d_backward_data_kernel,
-                N, C_in, H, W, C_out, KH, KW, stride=stride, padding=padding)
-            grad_input_nhwc = kernel_bd(grad_out_nhwc, weight_hwcf)
+            config = _get_config("conv2d_bwd_data", conv_shape)
+            key = ('conv2d_bwd_data', *conv_shape, tuple(sorted(config.items())))
+            kernel = _compile_kernel(key, make_conv2d_backward_data_kernel, conv_shape, config)
+            grad_input_nhwc = kernel(grad_out_nhwc, weight_hwcf)
             grad_input = grad_input_nhwc.permute(0, 3, 1, 2).float()
 
         if ctx.needs_input_grad[1]:
-            key_bw = ('conv2d_bwd_weight', N, C_in, H, W, C_out, KH, KW, stride, padding)
-            kernel_bw = _get_or_compile(
-                key_bw, make_conv2d_backward_weight_kernel,
-                N, C_in, H, W, C_out, KH, KW, stride=stride, padding=padding)
-            grad_weight_hwcf = kernel_bw(input_nhwc, grad_out_nhwc)
+            config = _get_config("conv2d_bwd_weight", conv_shape)
+            key = ('conv2d_bwd_weight', *conv_shape, tuple(sorted(config.items())))
+            kernel = _compile_kernel(key, make_conv2d_backward_weight_kernel, conv_shape, config)
+            grad_weight_hwcf = kernel(input_nhwc, grad_out_nhwc)
             grad_weight = grad_weight_hwcf.permute(3, 2, 0, 1).float()
 
         if bias is not None and ctx.needs_input_grad[2]:
@@ -121,8 +138,6 @@ class TileLangConv2dFunction(torch.autograd.Function):
 
 
 class TileLangConv2d(nn.Module):
-    """Drop-in replacement for nn.Conv2d using TileLang kernels."""
-
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
         if isinstance(kernel_size, int):
@@ -140,7 +155,6 @@ class TileLangConv2d(nn.Module):
         else:
             self.bias = None
 
-        # Kaiming init
         nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
@@ -155,20 +169,17 @@ class TileLangConv2d(nn.Module):
 class TileLangLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias):
-        """
-        input: (N, in_features) or (N, *, in_features)
-        weight: (out_features, in_features)
-        """
         input_2d = input.reshape(-1, input.shape[-1])
         M, K = input_2d.shape
         N_out = weight.shape[0]
 
         input_fp16 = _strict_contiguous(input_2d.half())
-        # weight^T: (K, N_out)
         weight_t = _strict_contiguous(weight.t().half())
 
-        key = ('linear_fwd', M, N_out, K)
-        kernel = _get_or_compile(key, make_gemm_kernel, M, N_out, K)
+        shape_args = (M, N_out, K)
+        config = _get_config("gemm_fwd", shape_args)
+        key = ('gemm_fwd', *shape_args, tuple(sorted(config.items())))
+        kernel = _compile_kernel(key, make_gemm_kernel, shape_args, config)
 
         output = kernel(input_fp16, weight_t).float()
 
@@ -191,21 +202,22 @@ class TileLangLinearFunction(torch.autograd.Function):
         grad_input = grad_weight = grad_bias = None
 
         if ctx.needs_input_grad[0]:
-            # grad_input = grad_output @ weight
             go_fp16 = _strict_contiguous(grad_output_2d.half())
             w_fp16 = _strict_contiguous(weight.half())
-            key = ('linear_bwd_input', M, K, N_out)
-            kernel = _get_or_compile(key, make_gemm_kernel, M, K, N_out)
-            # grad_output (M, N_out) @ weight (N_out, K) -> (M, K)
+            shape_args = (M, K, N_out)
+            config = _get_config("gemm_bwd_input", shape_args)
+            key = ('gemm_bwd_input', *shape_args, tuple(sorted(config.items())))
+            kernel = _compile_kernel(key, make_gemm_kernel, shape_args, config)
             gi = kernel(go_fp16, w_fp16)
             grad_input = gi.float().reshape(input.shape)
 
         if ctx.needs_input_grad[1]:
-            # grad_weight = grad_output^T @ input -> (N_out, K)
             go_fp16 = _strict_contiguous(grad_output_2d.t().half())
             in_fp16 = _strict_contiguous(input_2d.half())
-            key = ('linear_bwd_weight', N_out, K, M)
-            kernel = _get_or_compile(key, make_gemm_kernel, N_out, K, M)
+            shape_args = (N_out, K, M)
+            config = _get_config("gemm_bwd_weight", shape_args)
+            key = ('gemm_bwd_weight', *shape_args, tuple(sorted(config.items())))
+            kernel = _compile_kernel(key, make_gemm_kernel, shape_args, config)
             gw = kernel(go_fp16, in_fp16)
             grad_weight = gw.float()
 
@@ -216,19 +228,13 @@ class TileLangLinearFunction(torch.autograd.Function):
 
 
 class TileLangLinear(nn.Module):
-    """Drop-in replacement for nn.Linear using TileLang GEMM."""
-
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.bias = None
-
         nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
@@ -236,26 +242,18 @@ class TileLangLinear(nn.Module):
 
 
 # ============================================================
-# CNN Model using TileLang kernels
+# CNN Model
 # ============================================================
 
 class TileLangCNN(nn.Module):
     """
-    CNN for 28x28 grayscale classification using TileLang conv/linear kernels.
-    BatchNorm, ReLU, MaxPool, Dropout use PyTorch (these are memory-bound ops
-    where custom kernels offer little advantage over cuDNN).
-
-    Architecture matches Part 2 CNN:
-        TileLangConv2d(1,32,3,pad=1) -> BN -> ReLU -> TileLangConv2d(32,32,3,pad=1) -> BN -> ReLU -> MaxPool -> Drop
-        TileLangConv2d(32,64,3,pad=1) -> BN -> ReLU -> TileLangConv2d(64,64,3,pad=1) -> BN -> ReLU -> MaxPool -> Drop
-        TileLangConv2d(64,128,3,pad=1) -> BN -> ReLU -> GAP
-        TileLangLinear(128,64) -> ReLU -> Drop -> TileLangLinear(64,12)
+    CNN using TileLang autotuned kernels for conv2d and linear.
+    BatchNorm/ReLU/MaxPool/Dropout use PyTorch (memory-bound, no benefit from custom kernels).
     """
 
     def __init__(self, num_classes=12, dropout_rate=0.3):
         super().__init__()
 
-        # Block 1: 28x28 -> 14x14
         self.conv1a = TileLangConv2d(1, 32, 3, padding=1)
         self.bn1a = nn.BatchNorm2d(32)
         self.conv1b = TileLangConv2d(32, 32, 3, padding=1)
@@ -263,7 +261,6 @@ class TileLangCNN(nn.Module):
         self.pool1 = nn.MaxPool2d(2, 2)
         self.drop1 = nn.Dropout2d(dropout_rate)
 
-        # Block 2: 14x14 -> 7x7
         self.conv2a = TileLangConv2d(32, 64, 3, padding=1)
         self.bn2a = nn.BatchNorm2d(64)
         self.conv2b = TileLangConv2d(64, 64, 3, padding=1)
@@ -271,33 +268,25 @@ class TileLangCNN(nn.Module):
         self.pool2 = nn.MaxPool2d(2, 2)
         self.drop2 = nn.Dropout2d(dropout_rate)
 
-        # Block 3: 7x7 -> GAP
         self.conv3 = TileLangConv2d(64, 128, 3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
 
-        # FC
         self.fc1 = TileLangLinear(128, 64)
         self.drop3 = nn.Dropout(dropout_rate * 1.5)
         self.fc2 = TileLangLinear(64, num_classes)
 
     def forward(self, x):
-        # Block 1
         x = F.relu(self.bn1a(self.conv1a(x)))
         x = F.relu(self.bn1b(self.conv1b(x)))
         x = self.drop1(self.pool1(x))
 
-        # Block 2
         x = F.relu(self.bn2a(self.conv2a(x)))
         x = F.relu(self.bn2b(self.conv2b(x)))
         x = self.drop2(self.pool2(x))
 
-        # Block 3
         x = F.relu(self.bn3(self.conv3(x)))
-
-        # GAP
         x = x.mean(dim=[2, 3])
 
-        # Classifier
         x = F.relu(self.fc1(x))
         x = self.drop3(x)
         x = self.fc2(x)

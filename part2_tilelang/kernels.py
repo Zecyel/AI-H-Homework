@@ -1,19 +1,57 @@
 """
-TileLang kernel templates for CNN operations.
-No hardcoded tile sizes — all configurations are injected by the autotuner.
+TileLang GPU kernels with built-in autotuning.
+Uses @tilelang.autotune + @tilelang.jit for native fast profiling.
 """
 
+import tilelang
 import tilelang.language as T
+from tilelang.autotuner import *
 
 
-def make_gemm_kernel(M, N, K, block_M, block_N, block_K, num_stages, threads,
-                     dtype="float16", accum_dtype="float32"):
-    """
-    GEMM kernel: C(M, N) = A(M, K) @ B(K, N).
-    All tile parameters are explicit — set by autotuner.
-    """
+# ============================================================
+# Autotune configs for SM80
+# ============================================================
+
+def get_gemm_configs():
+    """Search space for GEMM kernels."""
+    configs = []
+    for bM in [16, 32, 64, 128]:
+        for bN in [16, 32, 64, 128]:
+            for bK in [16, 32]:
+                for stages in [2, 3]:
+                    for threads in [64, 128]:
+                        configs.append({
+                            "block_M": bM, "block_N": bN, "block_K": bK,
+                            "num_stages": stages, "threads": threads,
+                        })
+    return configs
+
+
+def get_conv_configs():
+    """Search space for conv kernels."""
+    configs = []
+    for bM in [16, 32, 64]:
+        for bN in [16, 32, 64]:
+            for bK in [16, 32]:
+                for stages in [2, 3]:
+                    for threads in [64, 128]:
+                        configs.append({
+                            "block_M": bM, "block_N": bN, "block_K": bK,
+                            "num_stages": stages, "threads": threads,
+                        })
+    return configs
+
+
+# ============================================================
+# GEMM kernel
+# ============================================================
+
+@tilelang.autotune(configs=get_gemm_configs(), keys=["M", "N", "K"])
+@tilelang.jit(out_idx=[2])
+def gemm_kernel(M, N, K, block_M, block_N, block_K, num_stages, threads,
+                dtype=T.float16, accum_dtype=T.float32):
     @T.prim_func
-    def kernel(
+    def main(
         A: T.Tensor((M, K), dtype),
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
@@ -23,32 +61,30 @@ def make_gemm_kernel(M, N, K, block_M, block_N, block_K, num_stages, threads,
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
-
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(B[ko * block_K, bx * block_N], B_shared)
                 T.gemm(A_shared, B_shared, C_local)
-
             T.copy(C_local, C[by * block_M, bx * block_N])
+    return main
 
-    return kernel
 
+# ============================================================
+# Conv2d forward
+# ============================================================
 
-def make_conv2d_forward_kernel(N, C_in, H, W, C_out, KH, KW,
-                                stride, padding,
-                                block_M, block_N, block_K, num_stages, threads,
-                                dtype="float16", accum_dtype="float32"):
-    """
-    Conv2d forward via implicit im2col GEMM.
-    Input: (N, H, W, C_in) NHWC, Weight: (KH, KW, C_in, C_out), Output: (N, OH, OW, C_out)
-    """
+@tilelang.autotune(configs=get_conv_configs(), keys=["N", "C_in", "H", "W", "C_out", "KH", "KW", "stride", "padding"])
+@tilelang.jit(out_idx=[2])
+def conv2d_forward(N, C_in, H, W, C_out, KH, KW, stride, padding,
+                   block_M, block_N, block_K, num_stages, threads,
+                   dtype=T.float16, accum_dtype=T.float32):
     OH = (H + 2 * padding - KH) // stride + 1
     OW = (W + 2 * padding - KW) // stride + 1
     M_total = N * OH * OW
     K_total = KH * KW * C_in
 
     @T.prim_func
-    def kernel(
+    def main(
         data: T.Tensor((N, H, W, C_in), dtype),
         weight: T.Tensor((KH, KW, C_in, C_out), dtype),
         out: T.Tensor((N, OH, OW, C_out), dtype),
@@ -63,7 +99,6 @@ def make_conv2d_forward_kernel(N, C_in, H, W, C_out, KH, KW,
             out_flat = T.Tensor((M_total, C_out), dtype, out.data)
 
             T.clear(out_local)
-
             for k_iter in T.Pipelined(T.ceildiv(K_total, block_K), num_stages=num_stages):
                 for i, j in T.Parallel(block_M, block_K):
                     k = k_iter * block_K + j
@@ -85,24 +120,25 @@ def make_conv2d_forward_kernel(N, C_in, H, W, C_out, KH, KW,
 
             T.copy(out_local, out_shared)
             T.copy(out_shared, out_flat[by * block_M, bx * block_N])
+    return main
 
-    return kernel
 
+# ============================================================
+# Conv2d backward data
+# ============================================================
 
-def make_conv2d_backward_data_kernel(N, C_in, H, W, C_out, KH, KW,
-                                      stride, padding,
-                                      block_M, block_N, block_K, num_stages, threads,
-                                      dtype="float16", accum_dtype="float32"):
-    """
-    Conv2d backward w.r.t. input data.
-    """
+@tilelang.autotune(configs=get_conv_configs(), keys=["N", "C_in", "H", "W", "C_out", "KH", "KW", "stride", "padding"])
+@tilelang.jit(out_idx=[2])
+def conv2d_backward_data(N, C_in, H, W, C_out, KH, KW, stride, padding,
+                          block_M, block_N, block_K, num_stages, threads,
+                          dtype=T.float16, accum_dtype=T.float32):
     OH = (H + 2 * padding - KH) // stride + 1
     OW = (W + 2 * padding - KW) // stride + 1
     M_total = N * H * W
     K_total = KH * KW * C_out
 
     @T.prim_func
-    def kernel(
+    def main(
         grad_out: T.Tensor((N, OH, OW, C_out), dtype),
         weight: T.Tensor((KH, KW, C_in, C_out), dtype),
         grad_input: T.Tensor((N, H, W, C_in), dtype),
@@ -112,11 +148,9 @@ def make_conv2d_backward_data_kernel(N, C_in, H, W, C_out, KH, KW,
             weight_shared = T.alloc_shared((block_K, block_N), dtype)
             out_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             out_shared = T.alloc_shared((block_M, block_N), dtype)
-
             grad_input_flat = T.Tensor((M_total, C_in), dtype, grad_input.data)
 
             T.clear(out_local)
-
             for k_iter in T.Pipelined(T.ceildiv(K_total, block_K), num_stages=num_stages):
                 for i, j in T.Parallel(block_M, block_K):
                     k = k_iter * block_K + j
@@ -149,24 +183,25 @@ def make_conv2d_backward_data_kernel(N, C_in, H, W, C_out, KH, KW,
 
             T.copy(out_local, out_shared)
             T.copy(out_shared, grad_input_flat[by * block_M, bx * block_N])
+    return main
 
-    return kernel
 
+# ============================================================
+# Conv2d backward weight
+# ============================================================
 
-def make_conv2d_backward_weight_kernel(N, C_in, H, W, C_out, KH, KW,
-                                        stride, padding,
-                                        block_M, block_N, block_K, num_stages, threads,
-                                        dtype="float16", accum_dtype="float32"):
-    """
-    Conv2d backward w.r.t. weight.
-    """
+@tilelang.autotune(configs=get_conv_configs(), keys=["N", "C_in", "H", "W", "C_out", "KH", "KW", "stride", "padding"])
+@tilelang.jit(out_idx=[2])
+def conv2d_backward_weight(N, C_in, H, W, C_out, KH, KW, stride, padding,
+                            block_M, block_N, block_K, num_stages, threads,
+                            dtype=T.float16, accum_dtype=T.float32):
     OH = (H + 2 * padding - KH) // stride + 1
     OW = (W + 2 * padding - KW) // stride + 1
     M_total = KH * KW * C_in
     K_total = N * OH * OW
 
     @T.prim_func
-    def kernel(
+    def main(
         data: T.Tensor((N, H, W, C_in), dtype),
         grad_out: T.Tensor((N, OH, OW, C_out), dtype),
         grad_weight: T.Tensor((KH, KW, C_in, C_out), dtype),
@@ -176,12 +211,10 @@ def make_conv2d_backward_weight_kernel(N, C_in, H, W, C_out, KH, KW,
             grad_shared = T.alloc_shared((block_K, block_N), dtype)
             out_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             out_shared = T.alloc_shared((block_M, block_N), dtype)
-
             grad_out_flat = T.Tensor((K_total, C_out), dtype, grad_out.data)
             grad_weight_flat = T.Tensor((M_total, C_out), dtype, grad_weight.data)
 
             T.clear(out_local)
-
             for k_iter in T.Pipelined(T.ceildiv(K_total, block_K), num_stages=num_stages):
                 for i, j in T.Parallel(block_M, block_K):
                     m = by * block_M + i
@@ -203,5 +236,4 @@ def make_conv2d_backward_weight_kernel(N, C_in, H, W, C_out, KH, KW,
 
             T.copy(out_local, out_shared)
             T.copy(out_shared, grad_weight_flat[by * block_M, bx * block_N])
-
-    return kernel
+    return main

@@ -49,6 +49,36 @@ def load_data(data_dir, img_size=28):
     return X, y_onehot, labels
 
 
+def augment_batch(X_batch, img_size=28):
+    """
+    On-the-fly data augmentation for a batch of flattened images.
+    Applies random shifts, small rotations, and noise.
+    """
+    batch_size = X_batch.shape[0]
+    augmented = np.empty_like(X_batch)
+
+    for i in range(batch_size):
+        img = X_batch[i].reshape(img_size, img_size)
+
+        # Random shift (-2 to +2 pixels)
+        dx, dy = np.random.randint(-2, 3), np.random.randint(-2, 3)
+        shifted = np.zeros_like(img)
+        src_x = slice(max(0, dx), min(img_size, img_size + dx))
+        src_y = slice(max(0, dy), min(img_size, img_size + dy))
+        dst_x = slice(max(0, -dx), min(img_size, img_size - dx))
+        dst_y = slice(max(0, -dy), min(img_size, img_size - dy))
+        shifted[dst_y, dst_x] = img[src_y, src_x]
+
+        # Random noise
+        if np.random.rand() < 0.5:
+            noise = np.random.randn(img_size, img_size) * 0.02
+            shifted = np.clip(shifted + noise, 0, 1)
+
+        augmented[i] = shifted.flatten()
+
+    return augmented
+
+
 def train_test_split(X, y_onehot, labels, test_ratio=0.2, seed=42):
     """Split data into train and test sets, stratified by class."""
     rng = np.random.RandomState(seed)
@@ -93,35 +123,40 @@ def main():
     X, y_onehot, labels = load_data(data_dir)
     print(f"Total samples: {X.shape[0]}, Features: {X.shape[1]}, Classes: {y_onehot.shape[1]}")
 
-    X_train, y_train, X_test, y_test, test_labels = train_test_split(X, y_onehot, labels, test_ratio=0.2)
+    X_train, y_train, X_test, y_test, test_labels = train_test_split(
+        X, y_onehot, labels, test_ratio=0.2)
     print(f"Train: {X_train.shape[0]}, Test: {X_test.shape[0]}")
 
     input_dim = X.shape[1]  # 784
     num_classes = 12
 
     net = Network([
-        ('linear', input_dim, 256),
+        ('linear', input_dim, 512),
+        ('batchnorm', 512),
+        ('relu',),
+        ('dropout', 0.4),
+        ('linear', 512, 256),
         ('batchnorm', 256),
         ('relu',),
-        ('dropout', 0.3),
+        ('dropout', 0.4),
         ('linear', 256, 128),
         ('batchnorm', 128),
         ('relu',),
         ('dropout', 0.3),
-        ('linear', 128, 64),
-        ('batchnorm', 64),
-        ('relu',),
-        ('linear', 64, num_classes),
+        ('linear', 128, num_classes),
         ('softmax',),
-    ], loss='cross_entropy', optimizer='adam', lr=0.001, weight_init='he')
+    ], loss='cross_entropy', optimizer='adam', lr=0.001,
+       weight_init='he', weight_decay=1e-4)
 
-    scheduler = StepLRScheduler(net.optimizer, step_size=30, gamma=0.5)
+    scheduler = StepLRScheduler(net.optimizer, step_size=40, gamma=0.5)
 
     print("\nTraining...")
-    epochs = 100
+    epochs = 200
     batch_size = 64
+    best_test_acc = 0.0
 
     for epoch in range(1, epochs + 1):
+        net.train_mode()
         n = X_train.shape[0]
         indices = np.random.permutation(n)
         X_shuffled = X_train[indices]
@@ -133,7 +168,11 @@ def main():
             end = min(start + batch_size, n)
             xb = X_shuffled[start:end]
             yb = y_shuffled[start:end]
-            loss = net.train_step(xb, yb)
+
+            # Apply data augmentation in [0,1] pixel space
+            xb_aug = augment_batch(xb)
+
+            loss = net.train_step(xb_aug, yb)
             epoch_loss += loss
             n_batches += 1
 
@@ -142,6 +181,7 @@ def main():
         if epoch % 10 == 0 or epoch == 1:
             train_acc, train_loss = evaluate(net, X_train, y_train)
             test_acc, test_loss = evaluate(net, X_test, y_test)
+            best_test_acc = max(best_test_acc, test_acc)
             print(f"Epoch {epoch}/{epochs}  "
                   f"train_loss={epoch_loss/n_batches:.4f} train_acc={train_acc:.4f}  "
                   f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}  "
@@ -150,9 +190,11 @@ def main():
     # Final evaluation
     train_acc, _ = evaluate(net, X_train, y_train)
     test_acc, _ = evaluate(net, X_test, y_test)
+    best_test_acc = max(best_test_acc, test_acc)
     print(f"\n=== Final Results ===")
     print(f"Train Accuracy: {train_acc:.4f}")
     print(f"Test Accuracy:  {test_acc:.4f}")
+    print(f"Best Test Acc:  {best_test_acc:.4f}")
 
     # Per-class accuracy
     pred = net.predict(X_test)

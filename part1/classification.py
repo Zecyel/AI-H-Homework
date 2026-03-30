@@ -169,8 +169,6 @@ def main():
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        from sklearn.metrics import confusion_matrix
-
         cm = np.zeros((num_classes, num_classes), dtype=int)
         for true, predicted in zip(test_labels, pred_labels):
             cm[true][predicted] += 1

@@ -1,52 +1,17 @@
 """
-TileLang GPU kernels with built-in autotuning.
-Uses @tilelang.autotune + @tilelang.jit for native fast profiling.
+TileLang GPU kernels with persistent autotuning cache.
+First run benchmarks all configs and saves best to autotune_cache.json.
+Subsequent runs load from cache — zero autotuning overhead.
 """
 
 import tilelang
 import tilelang.language as T
-from tilelang.autotuner import *
 
 
 # ============================================================
-# Autotune configs for SM80
+# GEMM kernel (no @autotune — managed by autotune_cache.py)
 # ============================================================
 
-def get_gemm_configs():
-    """Search space for GEMM kernels."""
-    configs = []
-    for bM in [8, 16, 32, 64, 128]:
-        for bN in [8, 16, 32, 64, 128]:
-            for bK in [4, 8, 16, 32]:
-                for stages in [2, 3]:
-                    for threads in [32, 64, 128]:
-                        configs.append({
-                            "block_M": bM, "block_N": bN, "block_K": bK,
-                            "num_stages": stages, "threads": threads,
-                        })
-    return configs
-
-
-def get_conv_configs():
-    """Search space for conv kernels."""
-    configs = []
-    for bM in [8, 16, 32, 64]:
-        for bN in [8, 16, 32, 64]:
-            for bK in [4, 8, 16, 32]:
-                for stages in [2, 3]:
-                    for threads in [32, 64, 128]:
-                        configs.append({
-                            "block_M": bM, "block_N": bN, "block_K": bK,
-                            "num_stages": stages, "threads": threads,
-                        })
-    return configs
-
-
-# ============================================================
-# GEMM kernel
-# ============================================================
-
-@tilelang.autotune(configs=get_gemm_configs(), skip_check=True)
 @tilelang.jit(out_idx=[2])
 def gemm_kernel(M, N, K, block_M, block_N, block_K, num_stages, threads,
                 dtype=T.float16, accum_dtype=T.float32):
@@ -73,7 +38,6 @@ def gemm_kernel(M, N, K, block_M, block_N, block_K, num_stages, threads,
 # Conv2d forward
 # ============================================================
 
-@tilelang.autotune(configs=get_conv_configs(), skip_check=True)
 @tilelang.jit(out_idx=[2])
 def conv2d_forward(N, C_in, H, W, C_out, KH, KW, stride, padding,
                    block_M, block_N, block_K, num_stages, threads,
@@ -127,7 +91,6 @@ def conv2d_forward(N, C_in, H, W, C_out, KH, KW, stride, padding,
 # Conv2d backward data
 # ============================================================
 
-@tilelang.autotune(configs=get_conv_configs(), skip_check=True)
 @tilelang.jit(out_idx=[2])
 def conv2d_backward_data(N, C_in, H, W, C_out, KH, KW, stride, padding,
                           block_M, block_N, block_K, num_stages, threads,
@@ -190,7 +153,6 @@ def conv2d_backward_data(N, C_in, H, W, C_out, KH, KW, stride, padding,
 # Conv2d backward weight
 # ============================================================
 
-@tilelang.autotune(configs=get_conv_configs(), skip_check=True)
 @tilelang.jit(out_idx=[2])
 def conv2d_backward_weight(N, C_in, H, W, C_out, KH, KW, stride, padding,
                             block_M, block_N, block_K, num_stages, threads,

@@ -3,3 +3,4 @@ train_data/
 .vscode/
 *.pth
 *.log
+autotune_cache.json

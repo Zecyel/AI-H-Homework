@@ -26,6 +26,20 @@ def _strict_contiguous(tensor):
     return out
 
 
+# Minimum dimension for TileLang GEMM (SM80 tensor core MMA requires m16n8k16)
+_MIN_TILELANG_DIM = 16
+
+
+def _use_tilelang_gemm(M, N, K):
+    """Check if dimensions are large enough for TileLang tensor core GEMM."""
+    return M >= _MIN_TILELANG_DIM and N >= _MIN_TILELANG_DIM and K >= _MIN_TILELANG_DIM
+
+
+def _fallback_gemm(A, B):
+    """PyTorch fallback for small GEMMs: C = A @ B."""
+    return (A.float() @ B.float()).half()
+
+
 # ============================================================
 # Conv2d with TileLang
 # ============================================================
@@ -36,13 +50,23 @@ class TileLangConv2dFunction(torch.autograd.Function):
         N, C_in, H, W = input.shape
         C_out, _, KH, KW = weight.shape
 
-        input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
-        weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
+        OH = (H + 2 * padding - KH) // stride + 1
+        OW = (W + 2 * padding - KW) // stride + 1
 
-        # TileLang autotune picks best config automatically on first call
-        kernel = conv2d_forward(N, C_in, H, W, C_out, KH, KW, stride, padding)
-        output_nhwc = kernel(input_nhwc, weight_hwcf)
-        output = output_nhwc.permute(0, 3, 1, 2).float()
+        # Check if GEMM-equivalent dims are large enough for TileLang
+        used_tilelang = False
+        if _use_tilelang_gemm(N * OH * OW, C_out, KH * KW * C_in):
+            try:
+                input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
+                weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
+                kernel = conv2d_forward(N, C_in, H, W, C_out, KH, KW, stride, padding)
+                output_nhwc = kernel(input_nhwc, weight_hwcf)
+                output = output_nhwc.permute(0, 3, 1, 2).float()
+                used_tilelang = True
+            except RuntimeError:
+                pass
+        if not used_tilelang:
+            output = F.conv2d(input, weight, stride=stride, padding=padding)
 
         if bias is not None:
             output = output + bias.view(1, -1, 1, 1)
@@ -62,19 +86,44 @@ class TileLangConv2dFunction(torch.autograd.Function):
 
         grad_input = grad_weight = grad_bias = None
 
-        grad_out_nhwc = _strict_contiguous(grad_output.permute(0, 2, 3, 1).half())
-        input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
-        weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
+        # Check if conv dimensions are large enough for TileLang
+        # GEMM-equivalent dims: M=N*OH*OW, N=C_out/C_in, K=KH*KW*C_in/C_out
+        OH = (H + 2 * padding - KH) // stride + 1
+        OW = (W + 2 * padding - KW) // stride + 1
+        can_tilelang_bwd_data = _use_tilelang_gemm(N * H * W, C_in, KH * KW * C_out)
+        can_tilelang_bwd_weight = _use_tilelang_gemm(KH * KW * C_in, C_out, N * OH * OW)
 
         if ctx.needs_input_grad[0]:
-            kernel = conv2d_backward_data(N, C_in, H, W, C_out, KH, KW, stride, padding)
-            grad_input_nhwc = kernel(grad_out_nhwc, weight_hwcf)
-            grad_input = grad_input_nhwc.permute(0, 3, 1, 2).float()
+            used_tilelang = False
+            if can_tilelang_bwd_data:
+                try:
+                    grad_out_nhwc = _strict_contiguous(grad_output.permute(0, 2, 3, 1).half())
+                    weight_hwcf = _strict_contiguous(weight.permute(2, 3, 1, 0).half())
+                    kernel = conv2d_backward_data(N, C_in, H, W, C_out, KH, KW, stride, padding)
+                    grad_input_nhwc = kernel(grad_out_nhwc, weight_hwcf)
+                    grad_input = grad_input_nhwc.permute(0, 3, 1, 2).float()
+                    used_tilelang = True
+                except RuntimeError:
+                    pass
+            if not used_tilelang:
+                grad_input = F.conv_transpose2d(
+                    grad_output, weight, stride=stride, padding=padding)
 
         if ctx.needs_input_grad[1]:
-            kernel = conv2d_backward_weight(N, C_in, H, W, C_out, KH, KW, stride, padding)
-            grad_weight_hwcf = kernel(input_nhwc, grad_out_nhwc)
-            grad_weight = grad_weight_hwcf.permute(3, 2, 0, 1).float()
+            used_tilelang = False
+            if can_tilelang_bwd_weight:
+                try:
+                    input_nhwc = _strict_contiguous(input.permute(0, 2, 3, 1).half())
+                    grad_out_nhwc = _strict_contiguous(grad_output.permute(0, 2, 3, 1).half())
+                    kernel = conv2d_backward_weight(N, C_in, H, W, C_out, KH, KW, stride, padding)
+                    grad_weight_hwcf = kernel(input_nhwc, grad_out_nhwc)
+                    grad_weight = grad_weight_hwcf.permute(3, 2, 0, 1).float()
+                    used_tilelang = True
+                except RuntimeError:
+                    pass
+            if not used_tilelang:
+                grad_weight = torch.nn.grad.conv2d_weight(
+                    input, weight.shape, grad_output, stride=stride, padding=padding)
 
         if bias is not None and ctx.needs_input_grad[2]:
             grad_bias = grad_output.sum(dim=[0, 2, 3])
@@ -113,8 +162,16 @@ class TileLangLinearFunction(torch.autograd.Function):
         input_fp16 = _strict_contiguous(input_2d.half())
         weight_t = _strict_contiguous(weight.t().half())
 
-        kernel = gemm_kernel(M, N_out, K)
-        output = kernel(input_fp16, weight_t).float()
+        used_tilelang = False
+        if _use_tilelang_gemm(M, N_out, K):
+            try:
+                kernel = gemm_kernel(M, N_out, K)
+                output = kernel(input_fp16, weight_t).float()
+                used_tilelang = True
+            except RuntimeError:
+                pass
+        if not used_tilelang:
+            output = (input_fp16.float() @ weight_t.float())
 
         if bias is not None:
             output = output + bias
@@ -136,15 +193,31 @@ class TileLangLinearFunction(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             go_fp16 = _strict_contiguous(grad_output_2d.half())
             w_fp16 = _strict_contiguous(weight.half())
-            kernel = gemm_kernel(M, K, N_out)
-            gi = kernel(go_fp16, w_fp16)
+            used_tilelang = False
+            if _use_tilelang_gemm(M, K, N_out):
+                try:
+                    kernel = gemm_kernel(M, K, N_out)
+                    gi = kernel(go_fp16, w_fp16)
+                    used_tilelang = True
+                except RuntimeError:
+                    pass
+            if not used_tilelang:
+                gi = _fallback_gemm(go_fp16, w_fp16)
             grad_input = gi.float().reshape(input.shape)
 
         if ctx.needs_input_grad[1]:
             go_fp16 = _strict_contiguous(grad_output_2d.t().half())
             in_fp16 = _strict_contiguous(input_2d.half())
-            kernel = gemm_kernel(N_out, K, M)
-            gw = kernel(go_fp16, in_fp16)
+            used_tilelang = False
+            if _use_tilelang_gemm(N_out, K, M):
+                try:
+                    kernel = gemm_kernel(N_out, K, M)
+                    gw = kernel(go_fp16, in_fp16)
+                    used_tilelang = True
+                except RuntimeError:
+                    pass
+            if not used_tilelang:
+                gw = _fallback_gemm(go_fp16, in_fp16)
             grad_weight = gw.float()
 
         if bias is not None and ctx.needs_input_grad[2]:

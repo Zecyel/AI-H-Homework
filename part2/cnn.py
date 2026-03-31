@@ -10,6 +10,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
+import time
 from PIL import Image
 
 
@@ -385,11 +386,15 @@ def main():
     best_model_path = os.path.join(script_dir, 'best_cnn_model.pth')
 
     print("\nTraining...")
+    total_train_time = 0.0
     for epoch in range(1, epochs + 1):
+        t0 = time.time()
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion,
                                                 optimizer, device)
         test_loss, test_acc, _, _ = evaluate(model, test_loader, criterion, device)
         scheduler.step()
+        elapsed = time.time() - t0
+        total_train_time += elapsed
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
@@ -400,7 +405,10 @@ def main():
             print(f"Epoch {epoch:3d}/{epochs}  "
                   f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}  "
                   f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}  "
-                  f"lr={lr:.6f}  best={best_test_acc:.4f}")
+                  f"lr={lr:.6f}  best={best_test_acc:.4f}  "
+                  f"time={elapsed:.1f}s")
+
+    print(f"\nTotal training time: {total_train_time:.1f}s ({total_train_time/epochs:.2f}s/epoch)")
 
     # Load best model and final evaluation
     model.load_state_dict(torch.load(best_model_path, weights_only=True))

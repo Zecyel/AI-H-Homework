@@ -212,6 +212,7 @@ def main():
     print("\nTraining with TileLang kernels...")
     print("=" * 80)
 
+    total_train_time = 0.0
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion,
@@ -219,6 +220,7 @@ def main():
         test_loss, test_acc, _, _ = evaluate(model, test_loader, criterion, device)
         scheduler.step()
         elapsed = time.time() - t0
+        total_train_time += elapsed
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
@@ -231,6 +233,8 @@ def main():
                   f"test_loss={test_loss:.4f} test_acc={test_acc:.4f}  "
                   f"lr={lr:.6f}  best={best_test_acc:.4f}  "
                   f"time={elapsed:.1f}s")
+
+    print(f"\nTotal training time: {total_train_time:.1f}s ({total_train_time/epochs:.2f}s/epoch)")
 
     # Final evaluation with best model
     model.load_state_dict(torch.load(best_model_path, weights_only=True))
